@@ -52,7 +52,12 @@ pub(super) fn patch(level: &str, model: &str, body: &Value) -> proto::ReasoningP
         return skip("关闭思考或未知档位不注入绑定");
     };
     let (field, value) = match family(model) {
-        "thinking" => ("thinking", json!({ "type": "enabled" })),
+        // 「开思考」族直发命名档位，不再折成裸开关：走到这里 level 已经过
+        // `effort_rank` 闸，必然是正向档位，而上游 `/chat/completions` 认命名
+        // 档位（`normalize` 里的透传自 3.0.8 在线，实测 max 能到上游并 200）。
+        // 旧写法 `thinking.enabled` 会把绑定的档位静默抹掉，上游按自家默认
+        // 强度思考 —— 用户看到的「覆盖不生效」就是它。
+        "thinking" => ("reasoning_effort", json!(crate::reasoning::EFFORT_LEVELS[rank])),
         "low_high" => (
             "reasoning_effort",
             json!(if rank <= 1 { "low" } else { "high" }),
@@ -86,10 +91,9 @@ pub(super) fn normalize(body: &Value, model: &str) -> Value {
     match family(model) {
         // 正向档位**原样留在 `reasoning_effort`**：官方客户端只发开关，但上游的
         // `/chat/completions` 接受命名档位（3.0.8 起就是原样透传，实测 max 能到
-        // 上游并 200）。删掉它等于把客户端的档位选择抹平成「开思考」—— 用户看到
-        // 的 upstream=high 只是 `outbound` 对裸开关的展示口径，并非上游真收到了
-        // high。只有「关闭思考」两档才改写成 `thinking.disabled`：`none` / `off`
-        // 不是所有上游都认，而开关能明确表达关闭。
+        // 上游并 200）。删掉它等于把客户端的档位选择抹平成「开思考」，映射绑定
+        // 注入的命名档位也会在半路被折掉。只有「关闭思考」两档才改写成
+        // `thinking.disabled`：`none` / `off` 不是所有上游都认，而开关能明确表达关闭。
         "thinking" if !fields.get("thinking").is_some_and(|value| !value.is_null()) => {
             let off = fields
                 .get("reasoning_effort")
@@ -135,9 +139,86 @@ pub(super) fn outbound(body: &Value) -> Option<String> {
         .map(str::to_string)
         .or_else(
             || match body.pointer("/thinking/type").and_then(Value::as_str) {
-                Some("enabled") => Some("high".to_string()),
+                // 裸开关（官方客户端形态）不预支档位：它只表达开/关，级别是上游
+                // 默认，展示侧读不到就留空。曾把 enabled 固定展示成 high，用户
+                // 看到 `(high)` 就以为上游真收到了 high。
                 Some("disabled") => Some("off".to_string()),
                 _ => None,
             },
         )
+}
+
+#[cfg(test)]
+mod tests {
+    //! #522 回归：thinking 族的映射绑定要真的把档位带到上游，展示侧不许
+    //! 把裸开关预支成 high。
+    use super::*;
+    use proto::ReasoningPatch;
+
+    fn patch_set(level: &str, model: &str) -> (String, Value) {
+        let body = json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] });
+        match patch(level, model, &body) {
+            ReasoningPatch::Set { field, value } => (field, value),
+            ReasoningPatch::Skip { reason } => panic!("expected Set, got Skip: {reason}"),
+        }
+    }
+
+    #[test]
+    fn thinking_family_binding_carries_named_level() {
+        for (level, expected) in [("max", "max"), ("xhigh", "xhigh"), ("minimal", "minimal")] {
+            let (field, value) = patch_set(level, "sn-deepseek-v4-1-flash-1017");
+            assert_eq!(field, "reasoning_effort");
+            assert_eq!(value, json!(expected));
+        }
+    }
+
+    #[test]
+    fn thinking_family_binding_survives_normalize() {
+        // 注入发生在 `normalize` 之后，正向档位必须原样到达发送体。
+        let body = json!({
+            "model": "sn-deepseek-v4-1-flash-1017",
+            "reasoning_effort": "max",
+            "messages": [],
+        });
+        let normalized = normalize(&body, "sn-deepseek-v4-1-flash-1017");
+        assert_eq!(normalized.get("reasoning_effort"), Some(&json!("max")));
+        assert!(normalized.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_family_off_binding_is_skipped_not_switched() {
+        let body = json!({ "model": "sn-deepseek-v4-1-flash-1017", "messages": [] });
+        match patch("off", "sn-deepseek-v4-1-flash-1017", &body) {
+            ReasoningPatch::Skip { .. } => {}
+            ReasoningPatch::Set { field, value } => {
+                panic!("关闭档位不该注入：got Set {field}={value}")
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_client_params_are_never_overridden() {
+        let body = json!({
+            "model": "sn-deepseek-v4-1-flash-1017",
+            "reasoning_effort": "low",
+            "messages": [],
+        });
+        match patch("max", "sn-deepseek-v4-1-flash-1017", &body) {
+            ReasoningPatch::Skip { .. } => {}
+            ReasoningPatch::Set { field, value } => {
+                panic!("客户端已指定时不覆盖：got Set {field}={value}")
+            }
+        }
+    }
+
+    #[test]
+    fn bare_thinking_switch_is_not_displayed_as_a_level() {
+        // 官方客户端只发开关：级别未知，展示侧留空，不预支 high。
+        let body = json!({ "thinking": { "type": "enabled" } });
+        assert_eq!(outbound(&body), None);
+        let off = json!({ "thinking": { "type": "disabled" } });
+        assert_eq!(outbound(&off), Some("off".to_string()));
+        let named = json!({ "reasoning_effort": "max" });
+        assert_eq!(outbound(&named), Some("max".to_string()));
+    }
 }
