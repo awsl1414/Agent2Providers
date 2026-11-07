@@ -432,7 +432,7 @@ pub fn build_upstream_body(
     let request_id = super::cosy::random_uuid().unwrap_or_default();
     let session_id = session_id_for(user_id, upstream_key, session_seed);
 
-    json!({
+    let mut payload = json!({
         "request_id": request_id,
         "request_set_id": record_id,
         "chat_record_id": record_id,
@@ -484,7 +484,14 @@ pub fn build_upstream_body(
             "name": last_user_text.chars().take(30).collect::<String>(),
             "begin_at": crate::logging::now_ms(),
         },
-    })
+    });
+    // Qoder 后台按 business.model_key 归属模型；缺失时可能回落到 Auto。
+    if site.is_qoder() {
+        if let Some(business) = payload.get_mut("business").and_then(Value::as_object_mut) {
+            business.insert("model_key".to_string(), Value::String(upstream_key.to_string()));
+        }
+    }
+    payload
 }
 
 /// 按站点成形发往上游的 `model_config`。
@@ -648,5 +655,51 @@ pub fn truthy(value: &Value) -> bool {
         Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
         Value::String(text) => !text.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Qoder 后台按 business.model_key 归属模型（fbff6f0 / #336）：缺失时会
+    /// 回落到 Auto，请求记录里的「转发模型」跟着失真。千问办公不写这个键。
+    #[test]
+    fn qoder_body_carries_model_key_but_qwenwork_does_not() {
+        let messages = vec![serde_json::json!({ "role": "user", "content": "你好" })];
+        let thinking = ThinkingChoice { enable: None, effort: None };
+
+        let qoder = build_upstream_body(
+            "claude-sonnet-4-5",
+            &serde_json::json!({}),
+            &messages,
+            None,
+            None,
+            &thinking,
+            "uid",
+            None,
+            Site::QoderCn,
+        );
+        assert_eq!(
+            qoder.pointer("/business/model_key").and_then(Value::as_str),
+            Some("claude-sonnet-4-5"),
+            "Qoder 的 business.model_key 必须显式携带上游模型名"
+        );
+
+        let qwenwork = build_upstream_body(
+            "qwen3-max",
+            &serde_json::json!({}),
+            &messages,
+            None,
+            None,
+            &thinking,
+            "uid",
+            None,
+            Site::QwenworkCn,
+        );
+        assert!(
+            qwenwork.pointer("/business/model_key").is_none(),
+            "千问办公的模型归属不在 business.model_key（写上反而污染共享会话）"
+        );
     }
 }
