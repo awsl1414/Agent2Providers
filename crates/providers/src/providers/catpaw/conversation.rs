@@ -203,8 +203,21 @@ pub async fn run_conversation(
             "CatPaw 没有可用的登录凭证：请在账号页添加账号，或配置环境变量",
         ));
     }
-    let prepared = prepare(&request).await.map_err(|error| error.to_gateway())?;
+    let prepared = prepare(&request).await.map_err(prepare_error_to_gateway)?;
     execute(request, prepared, sink).await
+}
+
+/// prepare 阶段（参数 / 消息形状解析）的错误打上本地校验标记（#524）。
+///
+/// prepare 不碰上游：走到这里还是 4xx，错的一定是**请求本身** —— 换号无意义，
+/// 也不该给账号记退避。网关凭 `code`（不是文案）识别这一类：过线时由适配器
+/// 换成控制面信封（见 `adapter` 的转发错误映射），宿主按原状态码呈现。
+fn prepare_error_to_gateway(error: CatPawError) -> GatewayError {
+    let mut gateway = error.to_gateway();
+    if (400..500).contains(&gateway.status_code) {
+        gateway.code = Some(crate::errors::LOCAL_VALIDATION_CODE.to_string());
+    }
+    gateway
 }
 
 /// 复用会话注册表（供 W5 的账号切换调用，`clear_account` / `clear_all`）
@@ -633,5 +646,40 @@ pub(super) fn short_id(value: &str) -> &str {
     match value.char_indices().nth(8) {
         Some((index, _)) => &value[..index],
         None => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! #524 回归：本地校验类错误要带着显式类别过线，不能再退化成无分类的
+    //! INTERNAL（宿主对那类错误一律 502，客户端按 5xx 重试、换号重发坏请求）。
+    use super::*;
+    use crate::providers::catpaw::models::CatPawError;
+
+    #[test]
+    fn prepare_errors_carry_the_local_validation_marker() {
+        let gateway = prepare_error_to_gateway(CatPawError::bad_request("messages[34] 不合法"));
+        assert_eq!(gateway.status_code, 400);
+        assert_eq!(gateway.code.as_deref(), Some(crate::errors::LOCAL_VALIDATION_CODE));
+        assert_eq!(gateway.message, "messages[34] 不合法");
+    }
+
+    #[test]
+    fn non_client_errors_are_not_marked() {
+        // 5xx（上游/传输形态）不是请求形状问题，不打本地校验标记
+        let gateway = prepare_error_to_gateway(CatPawError::upstream("上游故障"));
+        assert_eq!(gateway.code, None);
+    }
+
+    #[test]
+    fn marked_errors_travel_in_the_control_envelope() {
+        let error = prepare_error_to_gateway(CatPawError::bad_request("tool 配对失败"));
+        let wire = error.into_control_message();
+        assert!(wire.starts_with("CONTROL_ERROR:"), "got: {wire}");
+        // 信封里要有状态码与类别码：宿主按这两个字段呈现与豁免换号
+        let payload = wire.trim_start_matches("CONTROL_ERROR:");
+        let value: serde_json::Value = serde_json::from_str(payload).expect("信封是合法 JSON");
+        assert_eq!(value.get("status"), Some(&serde_json::json!(400)));
+        assert_eq!(value.get("code"), Some(&serde_json::json!(crate::errors::LOCAL_VALIDATION_CODE)));
     }
 }

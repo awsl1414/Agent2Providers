@@ -16,8 +16,9 @@
 //! `rulesMessage`（来自 `developer` 消息）。
 //!
 //! ── 归一化规则总览（每条都对应原实现的一段，改前请先读它）────
-//!   1. `system` / `developer` 抽离，不进 `messages`；且必须位于所有对话
-//!      消息之前（顺序错了，模型的「指令 vs 历史」分层就错了）；
+//!   1. `system` / `developer` 抽离，不进 `messages`；无论出现在头部还是对话
+//!      中段，都折进 systemPromptContext / rulesMessage（上游没有「对话中间
+//!      的 system」的表达，权衡见 `assemble` 内注释，#524）；
 //!   2. 连续多条 `tool` 消息（OpenAI 并行工具调用）**合并**为单条 tool 消息的
 //!      多个 `tool_result` 块 —— 上游明确拒绝 tool 消息连续出现；
 //!   3. 相邻 `assistant` 消息合并（上游要求 assistant 不带 toolCall 时
@@ -425,12 +426,19 @@ fn assemble(
     for (index, item) in merged.into_iter().enumerate() {
         let message = match item {
             Stage1::Directive { role, text } => {
-                if !conversation.is_empty() {
-                    return Err(GatewayError::with_status(400, format!(
-                        "messages[{index}] 的 {} 必须位于所有对话消息之前",
-                        role.name()
-                    )));
-                }
+                // 中段 system/developer 不再拒之门外（#524）：上游协议里
+                // system 本来就没有「对话中间」的表达 —— 它只落在
+                // systemPromptContext / rulesMessage 两个字段上，所以折进同一
+                // 个位置是诚实的映射，不是降级。
+                //
+                // ── 语义权衡（为什么不用备选方案）──────────────────
+                // 折叠会把中段指令提升为全局系统提示，模型会把它当作「对所有
+                // 轮次都生效」而不是「历史第 N 条」。备选方案是包装成 user
+                // 消息（如「[system] …」）保留位置，但那是把指令伪装成用户
+                // 说过的话，方向同样失真，还多一层文案约定。发中段 system
+                // 的多是 agent 类 CLI 的上下文注入，意图本就是全局性的；
+                // 官方客户端从不会发这种请求形状。两案都不完美，选折叠：
+                // 与头部 system 走同一条合并链路，少一套特判。
                 match role {
                     DirectiveRole::System => system_parts.push(text),
                     DirectiveRole::Developer => developer_parts.push(text),
@@ -695,4 +703,57 @@ fn message_id(object: &Map<String, Value>) -> Value {
 /// `finished: message.finished !== false`（只有显式 `false` 才是未完成）
 fn finished_flag(object: &Map<String, Value>) -> Value {
     Value::Bool(object.get("finished").and_then(Value::as_bool) != Some(false))
+}
+
+#[cfg(test)]
+mod tests {
+    //! #524 回归：中段 system/developer 不再 400，折进与头部相同的
+    //! systemPromptContext / rulesMessage 链路。
+    use super::*;
+
+    fn text_message(role: &str, text: &str) -> Value {
+        json!({ "role": role, "content": [{ "type": "text", "text": text }] })
+    }
+
+    #[test]
+    fn a_mid_conversation_system_folds_into_system_prompt() {
+        let messages = [
+            text_message("user", "你好"),
+            text_message("system", "中段注入的上下文摘要"),
+            text_message("user", "继续"),
+        ];
+        let normalized =
+            normalize_messages(&messages, NormalizeOptions::default()).expect("不再拒绝中段 system");
+        assert_eq!(normalized.messages.len(), 2, "system 不进 messages");
+        assert_eq!(
+            normalized.system_prompt.as_deref(),
+            Some("中段注入的上下文摘要")
+        );
+        assert!(normalized.rules_message.is_none());
+    }
+
+    #[test]
+    fn head_and_mid_system_parts_join_in_order() {
+        let messages = [
+            text_message("system", "头部指令"),
+            text_message("user", "你好"),
+            text_message("system", "中段摘要"),
+            text_message("developer", "中段规则"),
+        ];
+        let normalized =
+            normalize_messages(&messages, NormalizeOptions::default()).expect("混合位置都能抽离");
+        // 按 \n\n 连接且保持出现顺序：中段指令与头部指令走同一条合并链路
+        assert_eq!(
+            normalized.system_prompt.as_deref(),
+            Some("头部指令\n\n中段摘要")
+        );
+        assert_eq!(normalized.rules_message.as_deref(), Some("中段规则"));
+    }
+
+    #[test]
+    fn continuation_fragments_still_reject_directives() {
+        // 续接片段的语义不同（只应含 tool 结果），那里的拒绝是有意的
+        let messages = [text_message("system", "不该出现在续接片段里")];
+        assert!(normalize_continuation_messages(&messages).is_err());
+    }
 }

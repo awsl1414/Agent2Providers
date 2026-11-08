@@ -198,7 +198,21 @@ impl Provider for CatPawProvider {
             request.telemetry = Some(std::sync::Arc::new(RequestTelemetry::new()));
             run_conversation(request, &mut sink)
                 .await
-                .map_err(GatewayError::into_message)
+                .map_err(|error| {
+                    // 本地校验类（prepare 打了 `local_validation` 标记的 4xx）用
+                    // 控制面信封过线：状态码与类别码都在，宿主按原状态码呈现、
+                    // 不算进换号 / 退避。其余错误保持旧通道 —— 上游往返过的失败
+                    // 另有分类通道（`classify_conversation_error`），在这儿改变
+                    // 它们的过线形态会牵动宿主的整套记账，不做。
+                    if error.status_code >= 400
+                        && error.status_code < 500
+                        && error.code.as_deref() == Some(crate::errors::LOCAL_VALIDATION_CODE)
+                    {
+                        error.into_control_message()
+                    } else {
+                        error.into_message()
+                    }
+                })
         })
     }
 
