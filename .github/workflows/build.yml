@@ -9,12 +9,11 @@ name: release
 # 收回本仓库：推 `v*` tag 就在这里出五个平台的包并挂 Release。
 #
 # ── 签名怎么办 ──────────────────────────────────────────────
-# ed25519 签名私钥（AGENT2API_PLUGIN_KEY）只存在上游构建仓的 secrets 里，
-# fork 拿不到，也不该硬造信任。所以本流程**不出签名**：产物按未签名包发布
-# （网关对未签名包的口径见 plugin_host/install.rs——手动安装放行、界面标黄，
-# 自动安装/自动补齐这类无人值守路径要求官方签名，装我们的包会明确报错）。
-# 签名步骤保留原样：拿到密钥（fork 自己的或上游的）配进 secrets 即自动生效，
-# 不用再改流程。
+# fork 已建立自有签名链（2026-11-08）：私钥（keyId fork-2026）存在本仓库
+# secrets 的 AGENT2API_PLUGIN_KEY 里，签名步骤以 secret 存在为开关 ——
+# 配了就签，没配就按未签名发布（与上游构建仓行为一致）。公钥已追加进
+# 网关的 OFFICIAL_PUBKEYS（上游 official-2026 保留，上游签名包仍可验）。
+# 换钥 = 重生成私钥改 secret + 网关信任根追加新钥 + 全量重签后删旧钥。
 #
 # ── 产物形状（与网关 plugin_host::update 的期待逐字对应）────
 # 资产名 `agent2api-providers-<version>-<target>.zip`，tag `v<version>`；
@@ -372,12 +371,22 @@ jobs:
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
-          NOTES="插件包 v${TAG#v}（fork 自建构建，未签名）。
+          # 签没签看产物说话，不猜 secret：签名步骤跑没跑、跑没跑成，最终都
+          # 落在 pack.json 的 signature 块上。Release 正文必须与资产一致，
+          # 否则用户按「未签名」的说明去装签名包（或反过来）会走错预期。
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if unzip -p "${zips[0]}" pack.json | grep -q '"signature"'; then
+            SIGN_NOTE="本包带 fork 自建签名链的 ed25519 签名（keyId fork-2026，公钥内置于网关）：手动安装与自动安装 / 自动补齐均可用。"
+          else
+            SIGN_NOTE="本包未带 ed25519 签名（无私钥）：网关手动安装与「从文件安装」放行，自动安装 / 自动补齐会拒绝。"
+          fi
+          NOTES="插件包 v${TAG#v}（fork 自建构建）。
 
           源码：https://github.com/$GITHUB_REPOSITORY/tree/$REF
 
-          资产名为 \`agent2api-providers-<version>-<target>.zip\`，网关的插件更新检查按这个名字找。
-          本包未带 ed25519 签名（签名私钥不在 fork 手里）：网关手动安装与「从文件安装」放行，自动安装 / 自动补齐会拒绝；附带 .sha256 供下载后核对。"
+          资产名为 \`agent2api-providers-<version>-<target>.zip\`，网关的插件更新检查按这个名字找。${SIGN_NOTE}
+          附带 .sha256 供下载后核对。"
 
           # gh 在 checkout 目录会把 origin 当作当前仓库；本工作流 checkout 的
           # 就是本仓库自己的 ref，$GITHUB_REPOSITORY 与之一致，显式传 -R 只是
