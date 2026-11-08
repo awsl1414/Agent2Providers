@@ -1,26 +1,24 @@
 name: release
 
-# 推 `v*` tag 时把发版交给独立构建仓库（`Agent2Builder/agent2api-providers-releases`）。
+# 插件包的五平台构建与发布（fork 自建版）。
 #
-# ── 主仓库为什么不再自己构建 ────────────────────────────────
-# 插件是五平台矩阵（Windows + 两个 macOS + 两个 Linux），跑一次是实打实的
-# 重负载；而 tag 是发版动作、频率不可控。把「打一个版本标签」变成「自动兑换
-# 五次虚拟机开机」，最坏情况下会被判定为 Actions 滥用。所以编译整体搬到
-# 专用构建账号下的仓库，主仓库这条工作流只做一件事：发一条极轻的派发请求。
+# ── 为什么改掉上游的派发流程 ────────────────────────────────
+# 上游把编译放在独立构建账号（Agent2Builder/agent2api-providers-releases），
+# 本仓库的 tag 只发一条 repository_dispatch。fork 没有 BUILDER_DISPATCH_TOKEN，
+# 派发必然失败；也不能把 fork 的 ref 派给上游构建仓去编。所以 fork 把构建
+# 收回本仓库：推 `v*` tag 就在这里出五个平台的包并挂 Release。
 #
-# ── 密钥在哪 ────────────────────────────────────────────────
-# 签名私钥（`AGENT2API_PLUGIN_KEY`）**只存在构建仓库的 secrets 里**，主仓库
-# 没有、也不需要。主仓库唯一要配的是 `BUILDER_DISPATCH_TOKEN`——一个对构建
-# 仓库有 contents write 权限的 token，只用来派发事件。
+# ── 签名怎么办 ──────────────────────────────────────────────
+# ed25519 签名私钥（AGENT2API_PLUGIN_KEY）只存在上游构建仓的 secrets 里，
+# fork 拿不到，也不该硬造信任。所以本流程**不出签名**：产物按未签名包发布
+# （网关对未签名包的口径见 plugin_host/install.rs——手动安装放行、界面标黄，
+# 自动安装/自动补齐这类无人值守路径要求官方签名，装我们的包会明确报错）。
+# 签名步骤保留原样：拿到密钥（fork 自己的或上游的）配进 secrets 即自动生效，
+# 不用再改流程。
 #
-# ── 为什么用 repository_dispatch 而不是 workflow_call ───────
-# 跨仓库的 `workflow_call` 要求两边在同一个仓库内，跨账号只能用 dispatch。
-# 这也是 magpie（yetone/magpie → yetone/magpie-releases）的做法。
-#
-# ── tag 仍然照常打 ──────────────────────────────────────────
-# 它是版本标记，也是 Cargo 按 tag 引用契约库的依据（网关 `server/Cargo.toml`
-# 的 `agent2api-provider-protocol = { git = ..., tag = "v..." }`），只是它不再
-# 触发本仓库的任何编译。
+# ── 产物形状（与网关 plugin_host::update 的期待逐字对应）────
+# 资产名 `agent2api-providers-<version>-<target>.zip`，tag `v<version>`；
+# 网关按这个名字找资产，改名等于更新检查永远查不到。每个 zip 附 .sha256。
 
 on:
   push:
@@ -28,45 +26,368 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: '要发布的版本号（不带 v 前缀；对应的 tag 必须已存在）'
-        required: true
+      ref:
+        description: '要构建的 git ref（tag 或分支，默认当前分支）'
+        required: false
         type: string
+      publish:
+        description: '发布为 Release（关闭则只上传 artifact）'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  REF: ${{ github.event.client_payload.ref || github.event.inputs.ref || github.ref_name }}
 
 jobs:
-  dispatch:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
-      ref: ${{ steps.meta.outputs.ref }}
+  # ── Windows x64 ───────────────────────────────────────────
+  windows-x64:
+    runs-on: windows-latest
     steps:
-      - name: 解析版本号与 ref
-        id: meta
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      # 编译通过 ≠ 能运行：缺 DLL、清单不对、路径写错都只在启动时暴露。
+      # 这一步真的把二进制拉起来，走一遍协议握手，全绿才算过。
+      - name: 验证协议（真机启动）
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers.exe
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target x86_64-pc-windows-msvc
+
+      - name: 签名（无私钥时跳过）
+        shell: bash
         env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            REF="$GITHUB_REF_NAME"
-            VERSION="${REF#v}"
-          else
-            VERSION="$INPUT_VERSION"
-            REF="v$VERSION"
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
           fi
-          # 换行或引号会往下面的 JSON 里注入字段
-          [[ "$VERSION" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || { echo "版本号不合法: $VERSION" >&2; exit 1; }
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "派发构建：版本 $VERSION（ref: $REF）"
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
 
-      - name: 派发到构建仓库
-        uses: peter-evans/repository-dispatch@v3
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
         with:
-          # 对构建仓库有 contents write 权限的 token（放在主仓库 secrets 里）
-          token: ${{ secrets.BUILDER_DISPATCH_TOKEN }}
-          repository: Agent2Builder/agent2api-providers-releases
-          event-type: release
-          client-payload: '{"ref": "${{ steps.meta.outputs.ref }}", "version": "${{ steps.meta.outputs.version }}"}'
+          name: plugin-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
 
-      - name: 提示去哪看进度
-        run: echo "构建在 https://github.com/Agent2Builder/agent2api-providers-releases/actions"
+  # ── macOS x64（Intel）─────────────────────────────────────
+  # macos-26-intel 是当前可用的 x86_64 标准 runner（macos-13 已于
+  # 2025-12-04 退役）。
+  macos-x64:
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      - name: 验证协议（真机启动）
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target x86_64-apple-darwin
+
+      - name: 签名（无私钥时跳过）
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-macos-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── macOS arm64（Apple Silicon）───────────────────────────
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      - name: 验证协议（真机启动）
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target aarch64-apple-darwin
+
+      - name: 签名（无私钥时跳过）
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-macos-arm64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── Linux x64 + arm64 ─────────────────────────────────────
+  # 每个架构在自己的原生 runner 上编、也在上面真跑一遍。不用 QEMU、不交叉：
+  # 交叉编译出来的 arm64 二进制在 x64 机器上跑不起来，那就没法做「真机启动
+  # 验证」—— 而编译通过不等于能运行（缺 so、权限、路径全在运行时才暴露）。
+  #
+  # ── 为什么用 ubuntu-22.04 而不是 ubuntu-latest ──────────────
+  # 插件跑在**用户机器上**，Linux 桌面端与 Docker 用户共用同一份 gnu 包。
+  # Docker 运行镜像是 `debian:bookworm-slim`（glibc 2.36）。22.04 的 glibc
+  # 是 2.35，比 bookworm 更低 —— glibc 向前兼容，所以 22.04 上编出来的包在
+  # bookworm 容器和更新的发行版上都能跑。反过来（在 24.04 上编，glibc 2.39）
+  # 装进容器会报 `GLIBC_2.39 not found`，现场只显示「插件启动失败」，很难查。
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: plugin-linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: plugin-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      - name: 验证协议（真机启动）
+        run: |
+          set -euo pipefail
+          BIN=target/release/agent2api-providers
+          chmod +x "$BIN"
+          node scripts/verify.mjs --exe "$BIN"
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target "${{ matrix.target }}"
+
+      - name: 签名（无私钥时跳过）
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── 发布：五个平台的包汇成一个 Release ─────────────────────
+  publish:
+    needs: [windows-x64, macos-x64, macos-arm64, linux]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # 只为读 pack.json 的版本号 —— 资产名必须与包内声明的版本一致，
+      # 否则网关的更新检查按名字找不到资产（不报错，只是永远「已是最新」）。
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REF }}
+
+      - name: 解析版本号
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./pack.json').version")
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::插件版本号不是合法的语义化版本: $VERSION"
+            exit 1
+          }
+          if [[ "$REF" == v* && "$REF" != "v$VERSION" ]]; then
+            echo "::error::tag $REF 与 pack.json 版本 $VERSION 不一致"
+            exit 1
+          fi
+          PRERELEASE=false
+          if [[ "${VERSION%%+*}" == *-* ]]; then PRERELEASE=true; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: 收集产物
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 核对平台数量并生成 sha256
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*.zip)
+          echo "共 ${#files[@]} 个包："
+          printf '  %s\n' "${files[@]}"
+          # 五个平台各一份。少一个就有平台装不上 —— 网关装包时硬校验
+          # 「包里有没有当前平台的入口」（`plugin_host::install::entry_for_target`）。
+          [ ${#files[@]} -eq 5 ] || { echo "::error::期望 5 个平台包，实际 ${#files[@]} 个"; exit 1; }
+          cd dist
+          # 每个包一份 .sha256（sha256sum 的默认格式：`<摘要>  <文件名>`）
+          sha256sum -- *.zip > SHA256SUMS.txt
+          for f in *.zip; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          NOTES="插件包 v${TAG#v}（fork 自建构建，未签名）。
+
+          源码：https://github.com/$GITHUB_REPOSITORY/tree/$REF
+
+          资产名为 \`agent2api-providers-<version>-<target>.zip\`，网关的插件更新检查按这个名字找。
+          本包未带 ed25519 签名（签名私钥不在 fork 手里）：网关手动安装与「从文件安装」放行，自动安装 / 自动补齐会拒绝；附带 .sha256 供下载后核对。"
+
+          # gh 在 checkout 目录会把 origin 当作当前仓库；本工作流 checkout 的
+          # 就是本仓库自己的 ref，$GITHUB_REPOSITORY 与之一致，显式传 -R 只是
+          # 把目标钉死，不吃隐式解析的亏。
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip dist/*.sha256 dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease="$PRERELEASE" --notes "$NOTES" --title "提供商增强 $TAG"
+          else
+            gh release create "$TAG" dist/*.zip dist/*.sha256 dist/SHA256SUMS.txt -R "$GITHUB_REPOSITORY" \
+              --title "提供商增强 $TAG" \
+              --notes "$NOTES" \
+              --prerelease="$PRERELEASE"
+          fi
