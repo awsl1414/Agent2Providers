@@ -1,0 +1,17 @@
+# git-untracked: files propagated from the main worktree to other worktrees.
+# See https://github.com/linyows/git-untracked
+#
+# 插件仓唯一的大件是 Rust target/（当前 3.6G）。用法：新建 worktree 后
+# 在其中跑一次 `git-untracked`（本机已安装）。
+version: 1
+defaults:
+  conflict: skip
+  link: relative
+rules:
+  # Rust 编译产物。link 共享同一份 target/，理由同 Agent2API 主仓：
+  # 磁盘零增量、增量编译复用，跨 worktree 并行 cargo 靠锁排队。
+  - path: target/
+    action: link
+
+# ── 不同步：插件包 dist 产物（pack 脚本可重建）、运行态凭据（本机在
+#    用户目录，不进仓）。
