@@ -77,7 +77,9 @@ const QUOTA_HINTS: &[&str] = &[
 ];
 
 /// 鉴权类信号
-const AUTH_HINTS: &[&str] = &["unauthorized", "not logged in", "invalid token", "token expired", "invalid_token"];
+const AUTH_HINTS: &[&str] = &[
+    "unauthorized", "not logged in", "not_login", "invalid token", "token expired", "invalid_token",
+];
 
 /// 上游错误的粗分类（转发层据此决定换账号 / 刷新 / 透传）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,7 +100,7 @@ pub enum UpstreamKind {
 /// 普通的 400 直接透传给客户端 —— 账号页不会进冷却，下一个请求还会选它。
 pub fn classify_upstream_error(status: u16, message: &str) -> UpstreamKind {
     let lower = message.to_ascii_lowercase();
-    if status == 401 || status == 403 {
+    if status == 401 {
         return UpstreamKind::Auth;
     }
     if status == 429 {
@@ -464,4 +466,29 @@ pub fn generate_content_url(llm_base: &str, request_id: &str) -> String {
 /// 从请求体里读客户端显式指定的思考档位（绑定让位判据用）。
 pub fn client_effort(body: &Value) -> Option<String> {
     crate::model_rules::read_client_level(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_upstream_error, UpstreamKind};
+
+    #[test]
+    fn explicit_401_is_auth_but_403_is_not() {
+        // 403 是权限/风控拒绝，刷新令牌救不回来；只有 401 才该触发续期。
+        assert_eq!(classify_upstream_error(401, ""), UpstreamKind::Auth);
+        assert_eq!(classify_upstream_error(403, "forbidden"), UpstreamKind::Other);
+    }
+
+    #[test]
+    fn not_login_on_http_200_is_an_auth_failure() {
+        // 上游把鉴权失败塞在 HTTP 200 + 业务码/文案里，状态码到不了 401。
+        assert_eq!(classify_upstream_error(200, "NOT_LOGIN"), UpstreamKind::Auth);
+        assert_eq!(classify_upstream_error(200, "not logged in"), UpstreamKind::Auth);
+    }
+
+    #[test]
+    fn quota_and_transport_errors_keep_their_kind() {
+        assert_eq!(classify_upstream_error(429, ""), UpstreamKind::Quota);
+        assert_eq!(classify_upstream_error(500, "internal"), UpstreamKind::Other);
+    }
 }

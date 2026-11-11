@@ -256,9 +256,10 @@ pub(crate) async fn record_limited(ctx: &PluginCtx, limit: &LimitContext, messag
 }
 
 /// 一帧的错误 → 网关错误（额度类带 429、鉴权类带 401）
-fn frame_error(frame: &Frame) -> GatewayError {
+pub(super) fn frame_error(frame: &Frame) -> GatewayError {
     let text = frame.error_text();
-    let kind = protocol::classify_upstream_error(200, &text);
+    let status = frame.error_code.parse::<u16>().ok().unwrap_or(200);
+    let kind = protocol::classify_upstream_error(status, &text);
     let status = match kind {
         UpstreamKind::Quota => 429,
         UpstreamKind::Auth => 401,
@@ -350,6 +351,56 @@ fn failure_frames(translator: &Translator, error: &GatewayError) -> String {
     })));
     out.push_str(&stream::sse_done());
     out
+}
+
+/// 开场判定：首个有效输出已开始下发，或在拿到它之前失败。
+///
+/// 上游把鉴权失败塞在 HTTP 200 的错误帧里，只有 `prefetch_stream_head`
+/// 返回 `Err` 才说明「还没吐出任何有效内容」；返回 `Ok` 时链路已经开始
+/// 下发正文或工具调用，重试会把它们再发一遍。
+pub(super) enum OpeningAction<T> {
+    Deliver(T),
+    /// 续期一次；同时带回这次鉴权失败的原文，续期也失败时拼进报错。
+    Refresh(GatewayError),
+    Fail(GatewayError),
+}
+
+/// 自动续期只许一次，且只在首个有效输出之前。
+///
+/// 第二次 401 说明续期也没救回来，再消耗刷新令牌只会让并发请求互相打断
+/// （`refresh::after_rejection` 的快照判据会因此反复落空）。
+pub(super) struct RenewalGate {
+    renewed: bool,
+    output_started: bool,
+}
+
+impl RenewalGate {
+    pub(super) fn new() -> Self {
+        Self { renewed: false, output_started: false }
+    }
+
+    pub(super) fn decide<T>(
+        &mut self,
+        opening: Result<T, GatewayError>,
+        can_refresh: bool,
+    ) -> OpeningAction<T> {
+        match opening {
+            Ok(value) => {
+                self.output_started = true;
+                OpeningAction::Deliver(value)
+            }
+            Err(error)
+                if !self.output_started
+                    && !self.renewed
+                    && error.status_code == 401
+                    && can_refresh =>
+            {
+                self.renewed = true;
+                OpeningAction::Refresh(error)
+            }
+            Err(error) => OpeningAction::Fail(error),
+        }
+    }
 }
 
 /// 首帧预读：没有有效正文、思考或具名工具调用时，不能发出成功响应头。
@@ -456,13 +507,19 @@ pub async fn drive_stream(
 /// 非流式：拉完整条流再聚合成一个 `chat.completion`。
 pub async fn drive_aggregate(
     ctx: &PluginCtx,
-    response: reqwest::Response,
+    mut source: FrameStream,
     mut translator: Translator,
     telemetry: std::sync::Arc<RequestTelemetry>,
     limit: &LimitContext,
+    prefetched: Vec<Frame>,
 ) -> Result<Value, GatewayError> {
-    let mut source = FrameStream::new(response);
-    while let Some(frame) = source.next().await? {
+    let mut prefetched = prefetched.into_iter();
+    loop {
+        let frame = match prefetched.next() {
+            Some(frame) => Some(frame),
+            None => source.next().await?,
+        };
+        let Some(frame) = frame else { break };
         if frame.is_error() {
             let error = frame_error(&frame);
             if error.status_code == 429 {
@@ -518,4 +575,93 @@ pub fn response_id() -> String {
     let uuid = crate::ids::new_conversation_id().replace('-', "");
     let short: String = uuid.chars().take(24).collect();
     format!("chatcmpl-{short}")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::errors::GatewayError;
+    use crate::providers::accio::stream::Frame;
+
+    use super::{frame_error, OpeningAction, RenewalGate};
+
+    fn auth_failure<T>(status: i32) -> Result<T, GatewayError> {
+        Err(GatewayError::with_status(status, "上游失败"))
+    }
+
+    #[test]
+    fn first_auth_failure_before_output_renews_once() {
+        let mut gate = RenewalGate::new();
+        assert!(matches!(gate.decide::<()>(auth_failure(401), true), OpeningAction::Refresh(_)));
+        // 首次续期成功：第二次开场拿到有效输出，直接下发。
+        assert!(matches!(gate.decide(Ok("首个有效输出"), true), OpeningAction::Deliver("首个有效输出")));
+    }
+
+    #[test]
+    fn second_auth_failure_is_not_renewed() {
+        let mut gate = RenewalGate::new();
+        assert!(matches!(gate.decide::<()>(auth_failure(401), true), OpeningAction::Refresh(_)));
+        // 重试后再失败：不能第二次消耗刷新令牌。
+        assert!(matches!(
+            gate.decide::<()>(auth_failure(401), true),
+            OpeningAction::Fail(error) if error.status_code == 401
+        ));
+    }
+
+    #[test]
+    fn failure_after_output_started_is_not_renewed() {
+        let mut gate = RenewalGate::new();
+        assert!(matches!(gate.decide(Ok("正文"), true), OpeningAction::Deliver("正文")));
+        // 已经下发过内容，续期重试会把正文/工具调用再发一遍。
+        assert!(matches!(
+            gate.decide::<()>(auth_failure(401), true),
+            OpeningAction::Fail(error) if error.status_code == 401
+        ));
+    }
+
+    #[test]
+    fn renewal_then_output_then_late_auth_failure() {
+        let mut gate = RenewalGate::new();
+        assert!(matches!(gate.decide::<()>(auth_failure(401), true), OpeningAction::Refresh(_)));
+        assert!(matches!(gate.decide(Ok(()), true), OpeningAction::Deliver(())));
+        assert!(matches!(gate.decide::<()>(auth_failure(401), true), OpeningAction::Fail(_)));
+    }
+
+    #[test]
+    fn non_auth_errors_never_renew() {
+        for status in [400, 403, 429, 500, 502] {
+            let mut gate = RenewalGate::new();
+            assert!(matches!(
+                gate.decide::<()>(auth_failure(status), true),
+                OpeningAction::Fail(error) if error.status_code == status
+            ));
+        }
+    }
+
+    #[test]
+    fn auth_failure_without_refresh_credential_is_rejected() {
+        let mut gate = RenewalGate::new();
+        assert!(matches!(
+            gate.decide::<()>(auth_failure(401), false),
+            OpeningAction::Fail(error) if error.status_code == 401
+        ));
+    }
+
+    #[test]
+    fn frame_error_reads_the_frame_status_code() {
+        // 上游用 200 + 帧内错误码表达鉴权/额度失败，不能一律按 200 分类。
+        let auth = Frame { error_code: "401".to_string(), error_message: "NOT_LOGIN".to_string(), ..Frame::default() };
+        assert_eq!(frame_error(&auth).status_code, 401);
+
+        let quota = Frame { error_code: "429".to_string(), error_message: "quota".to_string(), ..Frame::default() };
+        assert_eq!(frame_error(&quota).status_code, 429);
+
+        let malformed = Frame { error_code: "not-a-number".to_string(), error_message: "boom".to_string(), ..Frame::default() };
+        assert_eq!(frame_error(&malformed).status_code, 502);
+    }
+
+    #[test]
+    fn frame_error_still_classifies_message_hints() {
+        let frame = Frame { error_message: "token expired".to_string(), ..Frame::default() };
+        assert_eq!(frame_error(&frame).status_code, 401);
+    }
 }

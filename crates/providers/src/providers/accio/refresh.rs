@@ -5,10 +5,8 @@
 //! `core::login` 里那套账号切换的安全版是 `/api/auth/safe/refresh_token`，
 //! 本网关不做账号切换，走普通那条）。
 //!
-//! ── 上游没回过期时间怎么办 ──────────────────────────────────
-//! `expiresAt` 缺失时给一个保守的默认值（1 小时）：它只影响「下次要不要续期」
-//! 的判定，给短了会多刷一次（无害），给长了会让一个已经失效的 token 留着不走
-//! 续期路径（有害）。桌面端的 token 有效期在小时级，1 小时是安全的下界。
+//! 上游可能保持令牌原值、只延长有效期；不能仅以令牌是否变化判定续期成功。
+//! 未返回有效期时使用 1 小时作为下次主动刷新时间。
 
 use std::sync::OnceLock;
 
@@ -81,6 +79,29 @@ pub async fn ensure_fresh(
             result
         }
     }
+}
+
+pub async fn after_rejection(
+    ctx: &PluginCtx,
+    account_id: &str,
+    region: super::endpoints::Region,
+    rejected: &Credentials,
+) -> Result<Credentials, GatewayError> {
+    let (_, current) = snapshot(ctx, account_id, region).await?;
+    // 在途请求被拒时，其他请求可能已经完成续期，不能再次消耗旧刷新凭证。
+    if already_renewed(&current, rejected) {
+        return Ok(current);
+    }
+    ensure_fresh(ctx, account_id, region, true).await
+}
+
+/// 台账里的凭证已经不是本次被拒的那份时，说明别的请求已续过期。
+///
+/// 上游可能保持令牌原值只延长有效期，所以 `expires_at` 前进也算一次有效续期。
+fn already_renewed(current: &Credentials, rejected: &Credentials) -> bool {
+    current.access_token != rejected.access_token
+        || current.refresh_token != rejected.refresh_token
+        || current.expires_at > rejected.expires_at
 }
 
 async fn refresh_and_save(
@@ -174,4 +195,40 @@ fn merge_credentials(expect: &Value, fresh: &Credentials) -> Value {
         Value::String(crate::store::token_tail(&fresh.access_token)),
     ));
     crate::store::with_fields(expect, &fields)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::credentials::Credentials;
+    use super::super::endpoints::Region;
+    use super::already_renewed;
+
+    fn credentials(access: &str, refresh: &str, expires: Option<i64>) -> Credentials {
+        Credentials {
+            region: Region::Global,
+            access_token: access.to_string(),
+            refresh_token: refresh.to_string(),
+            expires_at: expires,
+            user_id: "u".to_string(),
+            email: String::new(),
+            name: String::new(),
+            device_id: String::new(),
+            sgcookie: String::new(),
+        }
+    }
+
+    #[test]
+    fn unchanged_credentials_still_need_a_forced_refresh() {
+        let rejected = credentials("at", "rt", Some(1_000));
+        assert!(!already_renewed(&credentials("at", "rt", Some(1_000)), &rejected));
+    }
+
+    #[test]
+    fn any_other_request_having_refreshed_skips_the_second_refresh() {
+        let rejected = credentials("at", "rt", Some(1_000));
+        assert!(already_renewed(&credentials("at2", "rt", Some(1_000)), &rejected));
+        assert!(already_renewed(&credentials("at", "rt2", Some(1_000)), &rejected));
+        // 上游可能只延长有效期、令牌原值不变，也算一次有效续期。
+        assert!(already_renewed(&credentials("at", "rt", Some(2_000)), &rejected));
+    }
 }
