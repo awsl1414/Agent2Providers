@@ -15,10 +15,12 @@
 //! `systemPromptContext.systemPromptOverride`（来自 `system` 消息）与
 //! `rulesMessage`（来自 `developer` 消息）。
 //!
-//! ── 归一化规则总览（每条都对应原实现的一段，改前请先读它）────
-//!   1. `system` / `developer` 抽离，不进 `messages`；无论出现在头部还是对话
-//!      中段，都折进 systemPromptContext / rulesMessage（上游没有「对话中间
-//!      的 system」的表达，权衡见 `assemble` 内注释，#524）；
+//! ── 归一化规则总览 ──────────────────────────────────────────
+//!   1. `system` / `developer` 无论出现在头部、对话中段还是工具结果之间，都按
+//!      各自出现顺序抽离，折进 systemPromptContext / rulesMessage（上游没有
+//!      「对话中间的 system」的表达，权衡见 `normalize_messages` 内注释，#524）；
+//!      抽离须早于相邻消息合并与工具配对，否则指令会把本该合并的连续 tool
+//!      结果拆开，或在续接片段里被误判为非 tool 消息；
 //!   2. 连续多条 `tool` 消息（OpenAI 并行工具调用）**合并**为单条 tool 消息的
 //!      多个 `tool_result` 块 —— 上游明确拒绝 tool 消息连续出现；
 //!   3. 相邻 `assistant` 消息合并（上游要求 assistant 不带 toolCall 时
@@ -105,12 +107,11 @@ pub struct NormalizeOptions {
     pub allow_trailing_tool_calls: bool,
 }
 
-/// 中间形态：归一化 + 相邻合并后、抽离 system/developer 之前的一条消息。
+/// 单条消息归一化后的中间形态。
 ///
-/// 为什么需要中间层：原实现先 `normalizeMessage` 全部消息、再做相邻合并扫描，
-/// 最后在第二次遍历里抽离 system/developer 并做工具配对校验 —— 合成 tool 消息
-/// （打断补配对）插在「pending 工具调用」与新 user 消息之间，位置不能变
-/// （插错会让上游看到 tool 结果出现在它对应的 tool_call 之前）。
+/// 指令必须在合并与配对之前抽离：夹在两条 tool 结果之间的指令若留在流水线里，
+/// 会让它们不再相邻、合并不到一起（上游拒绝连续 tool 消息）；合成 tool 结果仍须
+/// 插在待响应工具调用与新 user 消息之间，位置不能变。
 enum Stage1 {
     /// system / developer：此时只记角色与文本
     Directive { role: DirectiveRole, text: String },
@@ -124,13 +125,9 @@ enum DirectiveRole {
     Developer,
 }
 
-impl DirectiveRole {
-    fn name(self) -> &'static str {
-        match self {
-            DirectiveRole::System => "system",
-            DirectiveRole::Developer => "developer",
-        }
-    }
+/// 客户端原始消息里是不是指令（续接配对扫描要跳过它们）。
+pub(super) fn is_directive(message: &Value) -> bool {
+    matches!(message.get("role").and_then(Value::as_str), Some("system" | "developer"))
 }
 
 /// 把 OpenAI `messages` 归一化成上游消息块（原实现 `normalizeMessages`）。
@@ -143,34 +140,47 @@ pub fn normalize_messages(
     if messages.is_empty() {
         return Err(GatewayError::with_status(400, "messages 必须是非空数组"));
     }
-    let mut stage: Vec<Stage1> = Vec::with_capacity(messages.len());
+    // 指令按出现顺序抽离，且早于合并与配对（见模块头规则 1）。
+    //
+    // ── 语义权衡（为什么折叠而不是保留位置，#524）──────────────
+    // 上游协议里 system 本来就没有「对话中间」的表达 —— 它只落在
+    // systemPromptContext / rulesMessage 两个字段上，所以中段指令折进同一个
+    // 位置是诚实的映射，不是降级。折叠会把它提升为全局系统提示，模型会当作
+    // 「对所有轮次都生效」而不是「历史第 N 条」；备选方案是包装成 user 消息
+    // （如「[system] …」）保留位置，但那是把指令伪装成用户说过的话，方向同样
+    // 失真，还多一层文案约定。发中段 system 的多是 agent 类 CLI 的上下文注入，
+    // 意图本就是全局性的，官方客户端从不会发这种请求形状。两案都不完美，选
+    // 折叠：与头部 system 走同一条链路，少一套特判。
+    let mut stage: Vec<(usize, Value)> = Vec::with_capacity(messages.len());
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut developer_parts: Vec<String> = Vec::new();
     for (index, message) in messages.iter().enumerate() {
-        stage.push(normalize_message(message, index)?);
+        match normalize_message(message, index)? {
+            Stage1::Directive { role: DirectiveRole::System, text } => system_parts.push(text),
+            Stage1::Directive { role: DirectiveRole::Developer, text } => developer_parts.push(text),
+            Stage1::Message(message) => stage.push((index, message)),
+        }
     }
-    assemble(merge_adjacent(stage), options)
+    Ok(NormalizedMessages {
+        messages: assemble(merge_adjacent(stage), options)?,
+        system_prompt: join_directives(&system_parts),
+        rules_message: join_directives(&developer_parts),
+    })
 }
 
 /// 工具结果续接请求的归一化（原实现 `normalizeContinuationMessages`）。
 ///
-/// 与 [`normalize_messages`] 的区别：**只做 `normalizeMessage` + tool 合并**，
-/// 不合并相邻 assistant、不抽离 system/developer、不做配对校验。
-/// 用途是「工具续接时从历史里切出那一条 tool 消息」
-/// （对应 `session-registry.mjs` 的 `continuationToolMessage`，T-d3 会用）。
+/// 与 [`normalize_messages`] 的区别：不合并相邻 assistant、不做配对校验。
+/// 用途是「工具续接时从历史里切出那一条 tool 消息」。
 ///
-/// 空输入返回空 Vec（原实现同，不报错 —— 调用方拿它判「没有可续接的内容」）。
-/// 出现 system/developer 时返回错误：续接片段里它们没有意义，原实现会在
-/// 调用点的「只能有一条 tool」校验里失败，这里提前给出更准确的文案。
+/// 空输入返回空 Vec；指令仍按同一套规则校验（非法内容照旧 400），但不进入续接
+/// 消息：完整指令已由准备阶段抽离、随本次 turn 的独立字段提交，留在片段里只会
+/// 让「只能有一条 tool」的校验把合法请求判死。
 pub fn normalize_continuation_messages(messages: &[Value]) -> Result<Vec<Value>, GatewayError> {
     let mut normalized: Vec<Value> = Vec::with_capacity(messages.len());
     for (index, message) in messages.iter().enumerate() {
-        match normalize_message(message, index)? {
-            Stage1::Directive { role, .. } => {
-                return Err(GatewayError::with_status(400, format!(
-                    "messages[{index}] 的 {} 必须位于所有对话消息之前",
-                    role.name()
-                )));
-            }
-            Stage1::Message(value) => normalized.push(value),
+        if let Stage1::Message(value) = normalize_message(message, index)? {
+            normalized.push(value);
         }
     }
     let mut merged: Vec<Value> = Vec::with_capacity(normalized.len());
@@ -374,80 +384,45 @@ fn normalize_tool(object: &Map<String, Value>, index: usize) -> Result<Stage1, G
 ///   - 相邻 assistant 且**至少一条没有 tool_use**：`content` 追加合并；
 ///     两条都带 tool_use 时**不合并**（原实现同：无法安全合并，
 ///     留到配对校验里报错，比静默错位好）。
-fn merge_adjacent(stage: Vec<Stage1>) -> Vec<Stage1> {
-    let mut merged: Vec<Stage1> = Vec::with_capacity(stage.len());
-    for item in stage {
-        let Stage1::Message(message) = &item else {
-            // system/developer 不参与合并（它们在下一步被抽离）
-            merged.push(item);
+fn merge_adjacent(stage: Vec<(usize, Value)>) -> Vec<(usize, Value)> {
+    let mut merged: Vec<(usize, Value)> = Vec::with_capacity(stage.len());
+    for (index, message) in stage {
+        let Some((_, previous)) = merged.last() else {
+            merged.push((index, message));
             continue;
         };
-        let previous = match merged.last() {
-            Some(Stage1::Message(previous)) => previous,
-            // 前一条是指令，或列表为空：不合并
-            _ => {
-                merged.push(item);
-                continue;
-            }
-        };
-        let current_type = message_type(message);
+        let current_type = message_type(&message);
         let previous_type = message_type(previous);
         let mergeable = if current_type == Some("tool") && previous_type == Some("tool") {
             true
         } else if current_type == Some("assistant") && previous_type == Some("assistant") {
-            !has_tool_use(previous) || !has_tool_use(message)
+            !has_tool_use(previous) || !has_tool_use(&message)
         } else {
             false
         };
         if mergeable {
-            if let Some(Stage1::Message(previous)) = merged.last_mut() {
-                append_content(previous, message);
+            if let Some((_, previous)) = merged.last_mut() {
+                append_content(previous, &message);
             }
             continue;
         }
-        merged.push(item);
+        merged.push((index, message));
     }
     merged
 }
 
-/// 抽离 system/developer + 工具配对校验 + 合成打断消息（原实现第 266-341 行）。
+/// 工具配对校验 + 合成打断消息；下标保留客户端原始位置。
 fn assemble(
-    merged: Vec<Stage1>,
+    merged: Vec<(usize, Value)>,
     options: NormalizeOptions,
-) -> Result<NormalizedMessages, GatewayError> {
+) -> Result<Vec<Value>, GatewayError> {
     let mut conversation: Vec<Value> = Vec::with_capacity(merged.len());
-    let mut system_parts: Vec<String> = Vec::new();
-    let mut developer_parts: Vec<String> = Vec::new();
     // 已出现过的 tool_call_id：重复出现说明客户端把同一轮工具调用塞了两次
     let mut known_tool_calls: Vec<String> = Vec::new();
     // 待响应工具调用：tool_call_id → toolName（assistant 声明、等 tool 结果）
     let mut pending_tool_calls: Vec<(String, String)> = Vec::new();
 
-    for (index, item) in merged.into_iter().enumerate() {
-        let message = match item {
-            Stage1::Directive { role, text } => {
-                // 中段 system/developer 不再拒之门外（#524）：上游协议里
-                // system 本来就没有「对话中间」的表达 —— 它只落在
-                // systemPromptContext / rulesMessage 两个字段上，所以折进同一
-                // 个位置是诚实的映射，不是降级。
-                //
-                // ── 语义权衡（为什么不用备选方案）──────────────────
-                // 折叠会把中段指令提升为全局系统提示，模型会把它当作「对所有
-                // 轮次都生效」而不是「历史第 N 条」。备选方案是包装成 user
-                // 消息（如「[system] …」）保留位置，但那是把指令伪装成用户
-                // 说过的话，方向同样失真，还多一层文案约定。发中段 system
-                // 的多是 agent 类 CLI 的上下文注入，意图本就是全局性的；
-                // 官方客户端从不会发这种请求形状。两案都不完美，选折叠：
-                // 与头部 system 走同一条合并链路，少一套特判。
-                match role {
-                    DirectiveRole::System => system_parts.push(text),
-                    DirectiveRole::Developer => developer_parts.push(text),
-                }
-                continue;
-            }
-            Stage1::Message(message) => message,
-        };
-
+    for (index, message) in merged {
         match message_type(&message) {
             Some("assistant") => {
                 if !pending_tool_calls.is_empty() {
@@ -494,13 +469,7 @@ fn assemble(
         ));
     }
 
-    // 多条 system/developer 用空行连接（原实现 `filter(Boolean).join('\n\n')`；
-    // 单条时结果就是它自己）
-    Ok(NormalizedMessages {
-        messages: conversation,
-        system_prompt: join_directives(&system_parts),
-        rules_message: join_directives(&developer_parts),
-    })
+    Ok(conversation)
 }
 
 /// 历史以 tool 结果结尾时补的那条合成 user 消息（见 `SYNTHETIC_CONTINUE_TEXT`）。
@@ -707,12 +676,28 @@ fn finished_flag(object: &Map<String, Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    //! #524 回归：中段 system/developer 不再 400，折进与头部相同的
-    //! systemPromptContext / rulesMessage 链路。
+    //! #524 的折叠语义与 B6a 的穿插指令回归：指令无论落在哪里都抽离到独立字段，
+    //! 且不得打断 tool_call 与 tool 结果的合并与配对。
     use super::*;
 
     fn text_message(role: &str, text: &str) -> Value {
         json!({ "role": role, "content": [{ "type": "text", "text": text }] })
+    }
+
+    fn tool_call_message(ids: &[&str]) -> Value {
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "calling tools" }],
+            "tool_calls": ids.iter().map(|id| json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": format!("tool_{id}"), "arguments": "{}" },
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn tool_result_message(call_id: &str, text: &str) -> Value {
+        json!({ "role": "tool", "tool_call_id": call_id, "content": text })
     }
 
     #[test]
@@ -750,10 +735,179 @@ mod tests {
         assert_eq!(normalized.rules_message.as_deref(), Some("中段规则"));
     }
 
+    /// 根因回归：指令夹在两条 tool 结果之间时，抽离必须早于合并，否则它们不再
+    /// 相邻、会作为两条连续 tool 消息提交（上游明确拒绝连续 tool 消息）。
     #[test]
-    fn continuation_fragments_still_reject_directives() {
-        // 续接片段的语义不同（只应含 tool 结果），那里的拒绝是有意的
-        let messages = [text_message("system", "不该出现在续接片段里")];
-        assert!(normalize_continuation_messages(&messages).is_err());
+    fn interleaved_directive_does_not_split_adjacent_tool_results() {
+        let messages = [
+            tool_call_message(&["c1", "c2"]),
+            tool_result_message("c1", "first"),
+            text_message("system", "穿插注入的上下文"),
+            tool_result_message("c2", "second"),
+        ];
+        let normalized = normalize_messages(&messages, NormalizeOptions::default())
+            .expect("穿插指令不该打断配对");
+        assert_eq!(
+            normalized.messages.len(),
+            2,
+            "两条 tool 结果应合并成一条 tool 消息"
+        );
+        let tool = &normalized.messages[1];
+        assert_eq!(message_type(tool), Some("tool"));
+        assert_eq!(
+            tool.get("content").and_then(Value::as_array).map(Vec::len),
+            Some(2),
+            "合并后的 tool 消息要带两个 tool_result 块"
+        );
+        assert_eq!(
+            normalized.system_prompt.as_deref(),
+            Some("穿插注入的上下文"),
+            "指令仍折进 systemPromptContext"
+        );
+    }
+
+    /// 边界：续接片段里的指令跳过而非 400，且不进入续接消息。
+    #[test]
+    fn continuation_fragment_skips_directives_and_keeps_tool_result() {
+        let messages = [
+            text_message("system", "不该进续接消息"),
+            tool_result_message("c1", "result"),
+            text_message("developer", "规则"),
+        ];
+        let normalized = normalize_continuation_messages(&messages)
+            .expect("续接片段里的指令应跳过而非 400");
+        assert_eq!(normalized.len(), 1, "只保留 tool 结果");
+        assert_eq!(message_type(&normalized[0]), Some("tool"));
+    }
+
+    #[test]
+    fn directive_only_continuation_fragment_is_empty_not_an_error() {
+        let messages = [text_message("system", "只有指令")];
+        let normalized = normalize_continuation_messages(&messages)
+            .expect("全是指令的片段返回空 Vec，由调用方判没有可续接内容");
+        assert!(normalized.is_empty());
+    }
+
+    /// 边界：指令落在尾部时仍抽离，不改变最后一条消息的形状。
+    #[test]
+    fn trailing_directive_is_folded_without_leaving_a_message() {
+        let messages = [
+            text_message("user", "你好"),
+            tool_call_message(&["c1"]),
+            tool_result_message("c1", "done"),
+            text_message("developer", "尾部规则"),
+        ];
+        let normalized = normalize_messages(&messages, NormalizeOptions::default())
+            .expect("尾部指令只抽离，不进 messages");
+        assert_eq!(normalized.messages.len(), 3);
+        assert_eq!(normalized.rules_message.as_deref(), Some("尾部规则"));
+        assert!(normalized.system_prompt.is_none());
+        assert_eq!(
+            normalized.messages.last().and_then(message_type),
+            Some("tool")
+        );
+    }
+
+    /// 边界：尾部指令抽离后，待响应 tool_call 仍按 allow_trailing 选项保留。
+    #[test]
+    fn trailing_directive_does_not_hide_pending_tool_calls() {
+        let messages = [tool_call_message(&["c1"]), text_message("system", "尾部注入")];
+        let normalized = normalize_messages(
+            &messages,
+            NormalizeOptions {
+                allow_trailing_tool_calls: true,
+            },
+        )
+        .expect("尾部指令抽离后，待响应 tool_call 仍按选项保留");
+        assert_eq!(normalized.messages.len(), 1);
+        assert_eq!(normalized.system_prompt.as_deref(), Some("尾部注入"));
+    }
+
+    /// 边界：多组工具调用各自配对，指令按出现顺序折进对应字段。
+    #[test]
+    fn multiple_tool_call_groups_pair_through_interleaved_directives() {
+        let messages = [
+            text_message("user", "第一问"),
+            tool_call_message(&["c1", "c2"]),
+            tool_result_message("c1", "答一"),
+            text_message("system", "组间指令一"),
+            tool_result_message("c2", "答二"),
+            text_message("user", "第二问"),
+            tool_call_message(&["c3"]),
+            text_message("developer", "组间指令二"),
+            tool_result_message("c3", "答三"),
+        ];
+        let normalized = normalize_messages(&messages, NormalizeOptions::default())
+            .expect("多组工具调用各自配对");
+        assert_eq!(normalized.messages.len(), 6, "user/asst/tool × 2");
+        assert_eq!(normalized.system_prompt.as_deref(), Some("组间指令一"));
+        assert_eq!(normalized.rules_message.as_deref(), Some("组间指令二"));
+        let tools: Vec<&Value> = normalized
+            .messages
+            .iter()
+            .filter(|message| message_type(message) == Some("tool"))
+            .collect();
+        assert_eq!(tools.len(), 2, "两组各一条合并后的 tool 消息");
+        for tool in tools {
+            let block = &tool.get("content").and_then(Value::as_array).unwrap()[0];
+            assert!(
+                block.get("toolName").and_then(Value::as_str).is_some(),
+                "toolName 由 assistant tool_call 回填"
+            );
+        }
+    }
+
+    /// 错误路径：指令携带非法内容时，无论全量归一化还是续接片段都照旧 400。
+    #[test]
+    fn directive_with_illegal_content_is_still_rejected() {
+        let with_tool_field = json!({
+            "role": "system",
+            "content": [{ "type": "text", "text": "注入" }],
+            "tool_calls": [],
+        });
+        let error = normalize_messages(
+            &[with_tool_field.clone(), text_message("user", "hi")],
+            NormalizeOptions::default(),
+        )
+        .expect_err("指令携带工具字段仍应 400");
+        assert_eq!(error.status_code, 400);
+        assert!(
+            error.message.contains("不允许携带工具字段"),
+            "got: {}",
+            error.message
+        );
+
+        let error = normalize_continuation_messages(&[with_tool_field])
+            .expect_err("续接片段跳过指令不等于放行非法指令");
+        assert_eq!(error.status_code, 400);
+
+        let empty = json!({
+            "role": "developer",
+            "content": [{ "type": "text", "text": "   " }],
+        });
+        let error = normalize_messages(
+            &[empty, text_message("user", "hi")],
+            NormalizeOptions::default(),
+        )
+        .expect_err("空白文本指令仍应 400");
+        assert_eq!(error.status_code, 400);
+        assert!(error.message.contains("只允许非空文本内容"));
+    }
+
+    /// 错误路径：跳过指令不能把「缺 tool 结果」也算成配对成功。
+    #[test]
+    fn skipping_directives_does_not_mask_a_missing_tool_result() {
+        let messages = [
+            tool_call_message(&["c1", "c2"]),
+            text_message("system", "穿插"),
+            tool_result_message("c1", "only one"),
+        ];
+        let error = normalize_messages(&messages, NormalizeOptions::default())
+            .expect_err("缺一个 tool 结果仍应明确报错");
+        assert_eq!(error.status_code, 400);
+        assert_eq!(
+            error.message,
+            "最后一条 assistant tool_call 缺少对应的 tool 结果"
+        );
     }
 }

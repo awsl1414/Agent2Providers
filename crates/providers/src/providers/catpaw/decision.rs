@@ -35,7 +35,7 @@ use crate::logging;
 
 use super::conversation::{registry, short_id, ConversationRequest};
 use super::fingerprint::{locate_increment, ChainPosition};
-use super::messages::normalize_continuation_messages;
+use super::messages::{is_directive, normalize_continuation_messages};
 use super::models::CatPawError;
 use super::prepare::Prepared;
 use super::registry::{InvalidationReason, SessionRecord, SessionResolution};
@@ -199,7 +199,7 @@ pub(super) fn decide(
 /// （原实现 `findPendingToolCallStart`）。
 ///
 /// 从后往前走，找最近一条「带非空 tool_calls 的 assistant」，再要求它之后的消息
-/// **全是 tool 且把每个 tool_call_id 都覆盖到**：
+/// **除已抽离的 system/developer 外全是 tool，且把每个 tool_call_id 都覆盖到**：
 ///   - 覆盖完整 → 这就是待响应集合（返回它的下标）；
 ///   - 全是 tool 但没覆盖完 → 本轮不是工具续接（原实现 `return -1`）；
 ///   - 中间混了别的角色 → 继续往前找（原实现内层 break 后继续外层循环）。
@@ -225,6 +225,11 @@ fn pending_tool_call_start(messages: &[Value]) -> Option<usize> {
             .collect();
         let mut valid = true;
         for item in &messages[index + 1..] {
+            if is_directive(item) {
+                // 指令在准备阶段已抽离到独立字段，客户端历史里的这一层注入不该
+                // 把待响应的 tool_call 判成「中间混了别的角色」。
+                continue;
+            }
             if item.get("role").and_then(Value::as_str) != Some("tool") {
                 valid = false;
                 break;
@@ -395,4 +400,131 @@ pub(super) fn submitted_fingerprints(decision: &Decision, synthetic_tail: bool) 
         submitted.push(super::fingerprint::message_fingerprint(continuation));
     }
     submitted
+}
+
+#[cfg(test)]
+mod tests {
+    //! B6a 回归：穿插在 tool_calls 与 tool 结果之间的指令不应让续接判定失效。
+    use super::*;
+    use serde_json::json;
+
+    fn directive(role: &str, text: &str) -> Value {
+        json!({ "role": role, "content": [{ "type": "text", "text": text }] })
+    }
+
+    fn assistant_tool_calls(ids: &[&str]) -> Value {
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "calling tools" }],
+            "tool_calls": ids.iter().map(|id| json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": format!("tool_{id}"), "arguments": "{}" },
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn tool_result(call_id: &str) -> Value {
+        json!({ "role": "tool", "tool_call_id": call_id, "content": "done" })
+    }
+
+    fn session(pending: &[&str]) -> SessionRecord {
+        SessionRecord {
+            conversation_id: "conv".to_string(),
+            fingerprints: Vec::new(),
+            model_type: 0,
+            account_id: String::new(),
+            created_at: 0,
+            last_active_at: i64::MAX,
+            inflight: false,
+            session_id: "sess".to_string(),
+            pending_call_ids: pending.iter().map(|id| (*id).to_string()).collect(),
+            turn_request_id: None,
+        }
+    }
+
+    /// 根因回归：指令穿插在 tool_calls 与 tool 结果之间时配对仍成立。
+    #[test]
+    fn pending_tool_call_start_skips_interleaved_directives() {
+        let messages = [
+            assistant_tool_calls(&["c1", "c2"]),
+            directive("system", "穿插注入"),
+            tool_result("c1"),
+            directive("developer", "规则"),
+            tool_result("c2"),
+        ];
+        assert_eq!(pending_tool_call_start(&messages), Some(0));
+        assert_eq!(
+            pending_call_ids(&messages),
+            vec!["c1".to_string(), "c2".to_string()]
+        );
+    }
+
+    /// 根因回归：走完整的续接取消息链路，指令不再让请求判为 malformed。
+    #[test]
+    fn continuation_message_pairs_through_interleaved_directives() {
+        let messages = [
+            assistant_tool_calls(&["c1"]),
+            directive("system", "穿插注入"),
+            tool_result("c1"),
+        ];
+        let message = continuation_message(&messages, &session(&["c1"]))
+            .ok()
+            .expect("穿插指令不再让续接请求判为 malformed");
+        assert_eq!(message.get("type").and_then(Value::as_str), Some("tool"));
+        let blocks = message.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(blocks.len(), 1, "只提交一条 tool_result");
+        assert_eq!(blocks[0].get("toolCallId").and_then(Value::as_str), Some("c1"));
+        assert_eq!(
+            blocks[0].get("toolName").and_then(Value::as_str),
+            Some("tool_c1"),
+            "toolName 从 assistant tool_calls 回填"
+        );
+    }
+
+    /// 边界：指令落在尾部也不应把已齐全的 tool 结果判成无效。
+    #[test]
+    fn trailing_directive_does_not_invalidate_pending_tool_calls() {
+        let messages = [
+            assistant_tool_calls(&["c1"]),
+            tool_result("c1"),
+            directive("system", "尾部注入"),
+        ];
+        assert_eq!(pending_tool_call_start(&messages), Some(0));
+        assert_eq!(pending_call_ids(&messages), vec!["c1".to_string()]);
+    }
+
+    /// 错误路径：跳过指令不等于放行缺结果 —— 集合不齐仍不是合法的续接。
+    #[test]
+    fn pending_tool_call_start_still_requires_every_result() {
+        let messages = [
+            assistant_tool_calls(&["c1", "c2"]),
+            directive("system", "穿插"),
+            tool_result("c1"),
+        ];
+        assert_eq!(pending_tool_call_start(&messages), None);
+        assert!(pending_call_ids(&messages).is_empty());
+    }
+
+    /// 错误路径：指令本身非法时，跳过也不能让续接片段放行。
+    #[test]
+    fn illegal_directive_in_continuation_is_still_malformed() {
+        let messages = [
+            assistant_tool_calls(&["c1"]),
+            json!({
+                "role": "system",
+                "content": [{ "type": "text", "text": "注入" }],
+                "tool_calls": [],
+            }),
+            tool_result("c1"),
+        ];
+        assert!(continuation_message(&messages, &session(&["c1"])).is_err());
+    }
+
+    /// 指令单独出现时不凭空造出待响应工具调用。
+    #[test]
+    fn directives_alone_do_not_create_a_pending_start() {
+        let messages = [directive("system", "a"), directive("developer", "b")];
+        assert_eq!(pending_tool_call_start(&messages), None);
+    }
 }
