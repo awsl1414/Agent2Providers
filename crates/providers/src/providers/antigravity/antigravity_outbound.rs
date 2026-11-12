@@ -53,13 +53,9 @@
 //!   5. **schema 清洗**（坑 #13）：见 `antigravity_schema.rs`（`type` 转小写、
 //!      去掉上游不认的 JSON Schema 键、展开 `anyOf/oneOf/allOf`、空对象补
 //!      `reason` 占位）；
-//!   6. **`thinkingBudget`**：显式档位（客户端或映射绑定写进 body 的
-//!      `reasoning_effort`）→ Manager 的档位规范值（1000/4000/10000）；
-//!      否则目录条目的 `thinkingBudget`；再否则目录认它支持思考时给
-//!      [`DEFAULT_THINKING_BUDGET`]。**`maxOutputTokens > thinkingBudget` 必须
-//!      成立**（坑 #10）：不够就抬到 `budget + 8192`（Manager 同款），
-//!      上限 [`MAX_OUTPUT_TOKENS`]（9router 的 64000，Manager 的逐模型上限
-//!      本仓拿不到 —— 见报告）；
+//!   6. **思考参数**：Argon 使用 `thinkingLevel`；其他模型的显式档位
+//!      （客户端或映射绑定的 `reasoning_effort`）转为数字预算，否则采用目录预算。
+//!      数字预算模式要求 `maxOutputTokens > thinkingBudget`；Argon 不套用该约束。
 //!   7. **`requestType` 默认不发**（规格 §8.1 的已定决策：两参考矛盾，
 //!      发了有「假 429」风险）；只有图片生成模型带 `"image_gen"`，
 //!      并照 Manager 去掉 `tools`/`systemInstruction`（图片生成不支持）；
@@ -699,6 +695,15 @@ fn generation_config(chat: &Value, model: &str, image_gen: bool) -> Value {
     let client_max = ["max_tokens", "max_completion_tokens"]
         .iter()
         .find_map(|key| chat.get(*key).and_then(Value::as_i64).filter(|value| *value > 0));
+    if super::argon::is_model(model) {
+        if let Some(thinking) = super::argon::thinking_config(chat, model) {
+            config.insert("thinkingConfig".to_string(), thinking);
+        }
+        if let Some(max) = client_max {
+            config.insert("maxOutputTokens".to_string(), json!(max.min(65_536)));
+        }
+        return Value::Object(config);
+    }
     match thinking_budget(chat, model) {
         Some(budget) => {
             let mut max = client_max;
@@ -798,5 +803,63 @@ fn request_id() -> String {
 /// `gemini-3.1-flash-image` 一族）
 fn is_image_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("image")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generation_config;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn argon_generation_config_uses_thinking_level() {
+        let config = generation_config(
+            &json!({"reasoning_effort": "low", "max_tokens": 100_000}),
+            "gemini-4-argon",
+            false,
+        );
+        assert_eq!(
+            config.get("thinkingConfig"),
+            Some(&json!({ "includeThoughts": true, "thinkingLevel": "LOW" }))
+        );
+        assert_eq!(
+            config.get("maxOutputTokens").and_then(Value::as_i64),
+            Some(65_536)
+        );
+        assert!(config
+            .get("thinkingConfig")
+            .and_then(|thinking| thinking.get("thinkingBudget"))
+            .is_none());
+    }
+
+    #[test]
+    fn argon_generation_config_omits_thinking_when_off() {
+        let config = generation_config(
+            &json!({"reasoning_effort": "off"}),
+            "gemini-4-argon-medium",
+            false,
+        );
+        assert!(config.get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn non_argon_generation_config_keeps_numeric_budget() {
+        let config = generation_config(
+            &json!({"reasoning_effort": "low"}),
+            "gemini-3-flash",
+            false,
+        );
+        let thinking = config.get("thinkingConfig");
+        assert!(thinking.is_some(), "非 Argon 模型仍应注入思考配置");
+        let Some(thinking) = thinking else { return; };
+        assert!(thinking.get("thinkingLevel").is_none());
+        assert_eq!(
+            thinking.get("thinkingBudget").and_then(Value::as_i64),
+            Some(1_000)
+        );
+        let max = config.get("maxOutputTokens").and_then(Value::as_i64);
+        assert!(max.is_some(), "非 Argon 思考模型仍应写 maxOutputTokens");
+        let Some(max) = max else { return; };
+        assert!(max > 1_000);
+    }
 }
 
